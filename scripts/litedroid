@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+usage() {
+    cat <<'EOF'
+Usage: bash scripts/litedroid COMMAND CONFIG [ARGUMENT]
+  doctor CONFIG                    Check a configured BSP and host tools
+  integrate CONFIG                 Install the shared fragment into the BSP
+  build CONFIG baseline|product    Build the selected vendor lunch target
+  report CONFIG SERIAL             Collect read-only device evidence via adb
+
+CONFIG is a literal key=value file, not a shell script. See README.md.
+No command flashes devices or downloads a vendor BSP.
+EOF
+}
+
+[[ $# -ge 1 ]] || { usage; exit 1; }
+if [[ "$1" == help || "$1" == --help ]]; then usage; exit 0; fi
+COMMAND="$1"
+[[ $# -ge 2 ]] || die "CONFIG is required."
+CONFIG="$2"
+case "$COMMAND" in
+    doctor|integrate) [[ $# == 2 ]] || die "Unexpected arguments." ;;
+    build|report) [[ $# == 3 ]] || die "$COMMAND requires one argument after CONFIG." ;;
+    *) die "Unknown command: $COMMAND" ;;
+esac
+[[ -f "$CONFIG" ]] || die "Config not found: $CONFIG"
+
+board= bsp_dir= lunch_target= jobs=4 remove_packages=
+declare -A seen=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *=* ]] || die "Expected key=value in $CONFIG."
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+        board|bsp_dir|lunch_target|jobs|remove_packages) ;;
+        *) die "Unknown config key: $key" ;;
+    esac
+    [[ ! ${seen[$key]+present} ]] || die "Duplicate config key: $key"
+    seen["$key"]=1
+    printf -v "$key" '%s' "$value"
+done < "$CONFIG"
+
+[[ "$board" =~ ^[a-zA-Z0-9_-]+$ ]] || die "board must be a nonempty identifier."
+[[ "$jobs" =~ ^[1-9][0-9]*$ && ${#jobs} -le 3 ]] || die "jobs must be an integer from 1 to 999."
+[[ "$remove_packages" =~ ^[a-zA-Z0-9_.[:space:]-]*$ ]] || die "Invalid package list."
+read -r -a packages <<< "$remove_packages"
+for package in "${packages[@]}"; do
+    [[ "$package" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || die "Invalid package name: $package"
+done
+
+require_bsp() {
+    [[ "$bsp_dir" == /* ]] || die "Set bsp_dir to an absolute vendor BSP path."
+    [[ -f "$bsp_dir/build/envsetup.sh" ]] || die "Missing BSP build/envsetup.sh: $bsp_dir"
+    [[ "$lunch_target" =~ ^[a-zA-Z0-9_.-]+-(userdebug|user)$ ]] ||
+        die "Set lunch_target to the vendor's exact userdebug/user target (including release if required)."
+}
+
+new_output() {
+    mkdir -p "$ROOT/out"
+    OUTPUT="$(mktemp -d "$ROOT/out/${board}-${COMMAND}-XXXXXX")"
+    printf 'Evidence directory: %s\n' "$OUTPUT"
+}
+
+write_fragment() {
+    cp "$ROOT/android/litedroid/product.mk" "$1/product.mk"
+    printf 'LITEDROID_REMOVE_PACKAGES := %s\n' "$remove_packages" > "$1/config.mk"
+}
+
+check_integration() {
+    local expected
+    [[ -f "$bsp_dir/vendor/litedroid/product.mk" && -f "$bsp_dir/vendor/litedroid/config.mk" ]] ||
+        die "Run integrate and include vendor/litedroid/product.mk in the selected product."
+    cmp -s "$ROOT/android/litedroid/product.mk" "$bsp_dir/vendor/litedroid/product.mk" ||
+        die "BSP product fragment differs from this checkout."
+    expected="LITEDROID_REMOVE_PACKAGES := $remove_packages"
+    [[ "$(cat "$bsp_dir/vendor/litedroid/config.mk")" == "$expected" ]] ||
+        die "BSP trimming config differs from CONFIG; review the integration files."
+}
+
+case "$COMMAND" in
+    doctor)
+        require_bsp
+        missing=0
+        for tool in git make sha256sum tee cmp; do
+            if command -v "$tool" >/dev/null 2>&1; then
+                printf 'OK: %s\n' "$tool"
+            else
+                printf 'MISSING: %s\n' "$tool" >&2
+                missing=1
+            fi
+        done
+        [[ "$missing" == 0 ]] || die "Required host tools are missing."
+        printf 'Board: %s\nBSP: %s\nTarget: %s\n' "$board" "$bsp_dir" "$lunch_target"
+        printf 'Basic checks passed; use the vendor guide for Java, host OS, disk and RAM requirements.\n'
+        ;;
+    integrate)
+        require_bsp
+        destination="$bsp_dir/vendor/litedroid"
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            [[ ! -L "$destination" ]] || die "Refusing a symlink integration directory."
+            check_integration
+            printf 'Integration files already match; nothing changed.\n'
+        else
+            mkdir -p "$bsp_dir/vendor"
+            mkdir "$destination"
+            write_fragment "$destination"
+            printf 'Installed %s\n' "$destination"
+        fi
+        printf 'Manually include vendor/litedroid/product.mk AFTER inheritance in your board product makefile.\n'
+        printf 'Do not include it for a pristine baseline build.\n'
+        ;;
+    build)
+        require_bsp
+        profile="$3"
+        [[ "$profile" == baseline || "$profile" == product ]] || die "Profile must be baseline or product."
+        if [[ "$profile" == product ]]; then check_integration; fi
+        new_output
+        (
+            # Vendor envsetup scripts commonly depend on unset variables.
+            set +u
+            cd "$bsp_dir"
+            source build/envsetup.sh || die "Vendor envsetup failed."
+            set -eo pipefail
+            lunch "$lunch_target" || die "Vendor lunch failed: $lunch_target"
+            actual_profile="$(get_build_var LITEDROID_PROFILE)" || die "Cannot read LITEDROID_PROFILE."
+            if [[ "$profile" == product ]]; then
+                [[ "$actual_profile" == minimal ]] ||
+                    die "Selected product does not include the LiteDroid fragment."
+                final_packages="$(get_build_var PRODUCT_PACKAGES)" || die "Cannot read PRODUCT_PACKAGES."
+                printf '%s\n' "$final_packages" > "$OUTPUT/product-packages.txt"
+                for package in "${packages[@]}"; do
+                    for included in $final_packages; do
+                        [[ "$included" != "$package" ]] ||
+                            die "Package $package is still included; place the fragment after inheritance."
+                    done
+                done
+            else
+                [[ -z "$actual_profile" ]] ||
+                    die "Baseline must use the original vendor product without the LiteDroid include."
+            fi
+            product_out="$(get_build_var PRODUCT_OUT)" || die "Cannot read PRODUCT_OUT."
+            [[ -n "$product_out" ]] || die "Vendor returned an empty PRODUCT_OUT."
+            if [[ "$product_out" != /* ]]; then product_out="$bsp_dir/$product_out"; fi
+            printf '%s\n' "$product_out" > "$OUTPUT/product-out.txt"
+            make -j"$jobs" || die "Vendor build failed; inspect build.log."
+            [[ -d "$product_out" ]] || die "Build returned success without a PRODUCT_OUT directory."
+            shopt -s nullglob
+            images=("$product_out"/*.img)
+            [[ ${#images[@]} -gt 0 ]] || die "No .img artifacts; adapt the build entry point to the vendor BSP."
+            sha256sum "${images[@]}" > "$OUTPUT/images.sha256"
+        ) 2>&1 | tee "$OUTPUT/build.log"
+        {
+            printf 'board=%s\nlunch_target=%s\nprofile=%s\njobs=%s\n' "$board" "$lunch_target" "$profile" "$jobs"
+            printf 'remove_packages=%s\nbsp_dir=%s\n' "$remove_packages" "$bsp_dir"
+            printf 'utc=%s\n' "$(date -u +%FT%TZ)"
+            printf 'litedroid_revision=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
+            printf 'litedroid_worktree_status:\n'
+            git -C "$ROOT" status --short
+        } > "$OUTPUT/build-metadata.txt"
+        if [[ "$profile" == product ]]; then
+            sha256sum "$bsp_dir/vendor/litedroid/"{product,config}.mk > "$OUTPUT/integration.sha256"
+        fi
+        printf 'Build passed. Image hashes: %s/images.sha256\n' "$OUTPUT"
+        printf 'Archive the BSP revision/patch manifest and images separately before release.\n'
+        ;;
+    report)
+        serial="$3"
+        [[ -n "$serial" && "$serial" != -* ]] || die "An explicit adb serial is required."
+        command -v adb >/dev/null 2>&1 || die "adb is not installed."
+        adb_read() { adb -s "$serial" "$@" || die "adb command failed: $*"; }
+        [[ "$(adb_read get-state)" == device ]] || die "Selected device is not online/authorized."
+        new_output
+        for property in ro.build.fingerprint ro.build.version.release ro.build.version.security_patch ro.product.board ro.build.type ro.boot.verifiedbootstate; do
+            value="$(adb_read shell getprop "$property")"
+            printf '%s=%s\n' "$property" "${value%$'\r'}"
+        done > "$OUTPUT/device.properties"
+        adb_read shell wm size > "$OUTPUT/display.txt"
+        adb_read shell dumpsys meminfo > "$OUTPUT/memory.txt"
+        adb_read shell cat /proc/uptime > "$OUTPUT/uptime.txt"
+        adb_read shell df -k /data > "$OUTPUT/data-space.txt"
+        printf 'Read-only report collected. Boot readiness, latency and recovery still require acceptance tests.\n'
+        ;;
+esac
