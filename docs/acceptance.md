@@ -9,7 +9,34 @@
 - 构建 profile、Android 版本、安全补丁、签名类型及外设清单。
 - 测试方法、样本数、测量工具、原始证据与异常说明。
 
-## 验收矩阵
+## 产物验证与闭环检验方法
+
+在产品裁剪构建完成后，严禁仅凭构建成功退出码或“镜像文件生成了”就判定产物可用。验证必须从**静态交付物**与**动态运行时**两层逐一核验：
+
+### 1. 静态产物完整性与合规性检验 (离线检查)
+
+在构建工作区和 `out/` 交付物中核验：
+* **包名剔除真实性 (`product-packages.txt`)**：
+  检查输出清单中是否确实排除了 `remove_packages` 声明的模块，且未误杀 `Settings`, `SystemUI`, `Launcher3`, `displayd`, `librknn*` 等核心系统与硬件 HAL 模块。
+* **分区镜像产出与哈希校验 (`images.sha256`)**：
+  验证 `boot.img`, `super.img`, `misc.img`, `recovery.img` 等全量镜像哈希已记录，且裁剪版本与基线版本的系统分区哈希存在预期差异（验证改动生效），引导与内核镜像保持一致（验证未破坏底层引脚与内核配置）。
+* **集成元数据留痕 (`integration.sha256`, `build-metadata.txt`)**：
+  验证构建时包含的代码提交版本、配置文件参数及无未归档的脏补丁。
+
+### 2. 动态运行与功能健康验证 (运行时检查)
+
+对于刷入 Radxa CM3 物理板卡（或在同配置宿主仿真环境）：
+* **冷启动与就绪检查**：
+  通过串口或 ADB 轮询 `getprop sys.boot_completed`，确认系统正常完成启动且返回 `1`。
+* **核心服务与桌面可用性**：
+  执行 `dumpsys activity activities | grep topResumedActivity`，确保默认桌面（如 `Launcher3`）处于活跃栈顶，未陷入循环崩溃（Bootloop）。
+* **交互路径回归**：
+  执行基础跳转命令（如拉起设置 `am start -n com.android.settings/.Settings` 再按 HOME 键返回），确保 ActivityManager 能够正常调度窗口与输入焦点。
+* **裁剪效果与资源回收实测**：
+  执行 `pm list packages` 核验已裁剪包不出现在已安装列表，并使用 `dumpsys meminfo` 与 `df -k /data` 采样内存和存储释放情况。
+* **异常诊断与崩溃排查**：
+  监听 `logcat -b crash` 与 `logcat -d | grep -iE "FATAL|AndroidRuntime|SIGSEGV"`，确认无因为剔除某模块而引发的类未找到（ClassNotFoundException）、空指针或死锁异常。
+
 
 | 项目 | 测量方法 | 基线 | 产品版 | 阈值/判定 |
 |---|---|---|---|---|

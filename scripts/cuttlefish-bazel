@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -n "${LITEDROID_BAZEL_RC:-}" && -f "$LITEDROID_BAZEL_RC" ]] || {
+    printf 'ERROR: LITEDROID_BAZEL_RC must point to the prepared host build configuration.\n' >&2
+    exit 1
+}
+exec /usr/bin/bazel --bazelrc="$LITEDROID_BAZEL_RC" "$@"

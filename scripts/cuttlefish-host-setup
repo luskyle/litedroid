@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+usage() {
+    cat <<'EOF'
+Usage: bash scripts/cuttlefish-host-setup --check|--build|--build-frontend|--install [LAB_DIRECTORY]
+
+Prepared Ubuntu 22.04 x86_64 host setup. Default lab:
+  /media/luskyle/DATA/android-lab
+
+--check verifies the prepared sources and Bazelisk download without installing.
+--build builds packages using already installed dependencies, without sudo.
+--build-frontend retries only frontend packaging after a successful base build.
+--install installs dependencies with sudo, builds as the current user, installs
+only cuttlefish-base/user, and adds the current user to the device groups.
+It does not run apt upgrade, reboot, download Android images, or start a VM.
+EOF
+}
+[[ $# -ge 1 && $# -le 2 ]] || { usage; exit 1; }
+mode="$1"
+[[ "$mode" == --check || "$mode" == --build || "$mode" == --build-frontend || "$mode" == --install ]] || { usage; exit 1; }
+lab="${2:-/media/luskyle/DATA/android-lab}"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ "$lab" == /* && -d "$lab" ]] || die "An existing absolute lab directory is required."
+source_dir="$lab/android-cuttlefish"
+bazel_deb="$lab/downloads/bazelisk-v1.29.0-amd64.deb"
+revision=76d805ff7bb91c7ad2b7d15f342d3605aaa008b0
+digest=186d78a20e1a64f59ba08987791a989892d142c9d3a9f9cc0c5c35e201f53924
+
+[[ "$(uname -m)" == x86_64 ]] || die "This prepared package is for x86_64 only."
+[[ -f "$source_dir/base/debian/control" && -f "$source_dir/frontend/debian/control" ]] ||
+    die "Prepared official Cuttlefish source is missing."
+[[ "$(git -C "$source_dir" rev-parse HEAD)" == "$revision" ]] ||
+    die "Source revision changed; review build dependencies before proceeding."
+[[ -z "$(git -C "$source_dir" status --porcelain --untracked-files=no)" ]] ||
+    die "Tracked source files have changes; review before building."
+[[ -f "$bazel_deb" ]] || die "Prepared Bazelisk package is missing."
+printf '%s  %s\n' "$digest" "$bazel_deb" | sha256sum -c -
+printf 'Source revision: %s\n' "$revision"
+printf 'Lab filesystem:\n'
+df -h "$lab"
+if [[ "$mode" == --check ]]; then
+    printf 'Prepared inputs verified. Installation and runtime are not yet verified.\n'
+    exit 0
+fi
+
+[[ "$EUID" != 0 ]] || die "Run this script as your normal user, not with sudo."
+# The package dependency list below is specific to the verified checkout.
+source /etc/os-release
+[[ "$ID" == ubuntu && "$VERSION_ID" == 22.04 ]] ||
+    die "This dependency workflow was prepared for Ubuntu 22.04 only."
+if [[ "$mode" == --install ]]; then
+    sudo -v
+    sudo apt-get update
+    sudo apt-get install --no-install-recommends \
+    "$bazel_deb" devscripts equivs config-package-dev debhelper dh-exec \
+    build-essential file unzip zip git curl cmake libaom-dev libc6-dev \
+    libcap-dev libclang-dev libcurl4-openssl-dev libfmt-dev libgbm-dev \
+    libgflags-dev libgoogle-glog-dev libgtest-dev libjsoncpp-dev liblzma-dev \
+    libopus-dev libprotobuf-c-dev libprotobuf-dev libsrtp2-dev libssl-dev \
+    libwayland-dev libxml2 libxml2-dev libz3-dev pkgconf protobuf-compiler \
+        uuid-dev xxd golang
+fi
+
+# Keep compiler downloads and caches off the small system disk.
+export XDG_CACHE_HOME="$lab/cache"
+export BAZELISK_HOME="$lab/cache/bazelisk"
+export DEB_BUILD_OPTIONS=parallel=2
+mkdir -p "$XDG_CACHE_HOME" "$BAZELISK_HOME"
+[[ -x /usr/bin/bazel ]] || die "Bazelisk installation did not provide /usr/bin/bazel."
+mkdir -p "$lab/logs"
+# Ubuntu 22.04's 5.15 UAPI lacks the requestbuffers.flags field used by virtio-media.
+# Export newer UAPI locally; do not change system headers or the running kernel.
+kernel_archive="$lab/downloads/linux-6.6.tar.xz"
+kernel_digest=d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0
+if [[ ! -f "$kernel_archive" ]]; then
+    curl --fail --location --retry 2 --connect-timeout 15 \
+        --output "$kernel_archive" https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
+fi
+printf '%s  %s\n' "$kernel_digest" "$kernel_archive" | sha256sum -c -
+if [[ ! -d "$lab/linux-6.6" ]]; then
+    tar -xJf "$kernel_archive" -C "$lab"
+fi
+make -C "$lab/linux-6.6" ARCH=x86 INSTALL_HDR_PATH="$lab/linux-uapi-6.6" headers_install \
+    > "$lab/logs/kernel-headers.log" 2>&1 || {
+    cat "$lab/logs/kernel-headers.log" >&2
+    die "Local Linux UAPI export failed."
+}
+mkdir -p "$lab/bin"
+cp "$root/scripts/cuttlefish-bazel" "$lab/bin/bazel"
+chmod +x "$lab/bin/bazel"
+export LITEDROID_BAZEL_RC="$lab/bazel-host.bazelrc"
+{
+    printf 'build --jobs=2\n'
+    printf 'build --@rules_rust//cargo/settings:use_default_shell_env=true\n'
+    printf 'build "--action_env=BINDGEN_EXTRA_CLANG_ARGS=-I%s/linux-uapi-6.6/include"\n' "$lab"
+} > "$LITEDROID_BAZEL_RC"
+export PATH="$lab/bin:/usr/local/bin:$PATH"
+export LITEDROID_NODE_CACHE="$lab/downloads"
+node_archive="$LITEDROID_NODE_CACHE/node-v22.14.0-linux-x64.tar.xz"
+node_digest=69b09dba5c8dcb05c4e4273a4340db1005abeafe3927efda2bc5b249e80437ec
+if [[ ! -f "$node_archive" ]]; then
+    /usr/bin/curl --fail --location --retry 2 --connect-timeout 15 --max-time 300 \
+        --speed-limit 1024 --speed-time 30 --output "$node_archive" \
+        https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz
+fi
+printf '%s  %s\n' "$node_digest" "$node_archive" | sha256sum -c -
+/usr/bin/curl --fail --location --retry 2 --connect-timeout 15 --max-time 60 \
+    --output "$LITEDROID_NODE_CACHE/node-v22.14.0-SHASUMS256.txt" \
+    https://nodejs.org/dist/v22.14.0/SHASUMS256.txt
+grep -Fx "$node_digest  node-v22.14.0-linux-x64.tar.xz" \
+    "$LITEDROID_NODE_CACHE/node-v22.14.0-SHASUMS256.txt" >/dev/null ||
+    die "Node.js upstream checksum differs from the pinned build input."
+cp "$root/scripts/cuttlefish-curl" "$lab/bin/curl"
+chmod +x "$lab/bin/curl"
+preserve_env=()
+for name in XDG_CACHE_HOME BAZELISK_HOME DEB_BUILD_OPTIONS LITEDROID_BAZEL_RC LITEDROID_NODE_CACHE \
+    http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; do
+    if printenv "$name" >/dev/null; then
+        preserve_env+=("--preserve-envvar=$name")
+    fi
+done
+components=(base frontend)
+if [[ "$mode" == --build-frontend ]]; then
+    [[ -f "$source_dir/cuttlefish-base_1.58.0_amd64.deb" ]] ||
+        die "Frontend-only retry requires the already built base package."
+    components=(frontend)
+fi
+if [[ "$mode" != --build-frontend ]]; then
+(
+    cd "$source_dir/base"
+    dpkg-checkbuilddeps
+    cd cvd
+    # A server started by debuild without proxy variables retains that environment.
+    bazel shutdown
+    bazel build //:build_compilation_mode_txt
+    [[ -s bazel-bin/build/compilation_mode.txt ]] ||
+        die "Bazel preflight did not produce compilation_mode.txt."
+) 2>&1 | tee "$lab/logs/bazel-preflight.log"
+fi
+for component in "${components[@]}"; do
+    (
+        cd "$source_dir/$component"
+        dpkg-checkbuilddeps
+        debuild "${preserve_env[@]}" --prepend-path "$lab/bin" -i -uc -us -b
+    ) 2>&1 | tee "$lab/logs/build-$component.log"
+done
+
+shopt -s nullglob
+base_packages=("$source_dir"/cuttlefish-base_*_amd64.deb)
+user_packages=("$source_dir"/cuttlefish-user_*_amd64.deb)
+[[ ${#base_packages[@]} == 1 && ${#user_packages[@]} == 1 ]] ||
+    die "Expected exactly one base and one user package; review existing build artifacts."
+sha256sum "${base_packages[@]}" "${user_packages[@]}" > "$lab/logs/host-packages.sha256"
+if [[ "$mode" == --build || "$mode" == --build-frontend ]]; then
+    printf 'Host packages built and checksummed; installation and runtime are not verified.\n'
+    exit 0
+fi
+sudo apt-get install "${base_packages[@]}" "${user_packages[@]}"
+sudo usermod -aG kvm,cvdnetwork,render "$(id -un)"
+for package in cuttlefish-base cuttlefish-user; do
+    [[ "$(dpkg-query -W -f='${Status}' "$package")" == 'install ok installed' ]] ||
+        die "Host package installation is incomplete: $package"
+done
+printf 'Host packages installed. Save your work and reboot manually before runtime validation.\n'
+printf 'Android images have not been downloaded and no VM has been launched.\n'

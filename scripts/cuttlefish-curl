@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# == 4 && "$2" == -O && "$3" == --retry && "$4" == 3 &&
+      -n "${LITEDROID_NODE_CACHE:-}" ]]; then
+    case "$1" in
+        https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz)
+            archive="$LITEDROID_NODE_CACHE/node-v22.14.0-linux-x64.tar.xz"
+            printf '%s  %s\n' \
+                69b09dba5c8dcb05c4e4273a4340db1005abeafe3927efda2bc5b249e80437ec \
+                "$archive" | sha256sum -c - >&2
+            cp "$archive" ./node-v22.14.0-linux-x64.tar.xz
+            exit 0
+            ;;
+        https://nodejs.org/dist/v22.14.0/SHASUMS256.txt)
+            cp "$LITEDROID_NODE_CACHE/node-v22.14.0-SHASUMS256.txt" ./SHASUMS256.txt
+            exit 0
+            ;;
+    esac
+fi
+exec /usr/bin/curl --connect-timeout 15 --max-time 300 --speed-limit 1024 --speed-time 30 "$@"
